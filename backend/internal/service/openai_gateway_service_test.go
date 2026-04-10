@@ -83,6 +83,7 @@ type stubConcurrencyCache struct {
 	loadBatchErr    error
 	loadMap         map[int64]*AccountLoadInfo
 	acquireResults  map[int64]bool
+	releaseCounts   map[int64]int
 	waitCounts      map[int64]int
 	skipDefaultLoad bool
 }
@@ -116,6 +117,9 @@ func (c stubConcurrencyCache) AcquireAccountSlot(ctx context.Context, accountID 
 }
 
 func (c stubConcurrencyCache) ReleaseAccountSlot(ctx context.Context, accountID int64, requestID string) error {
+	if c.releaseCounts != nil {
+		c.releaseCounts[accountID]++
+	}
 	return nil
 }
 
@@ -421,6 +425,56 @@ func TestOpenAISelectAccountWithLoadAwareness_FiltersUnschedulableWhenNoConcurre
 	if selection.Account.ID != available.ID {
 		t.Fatalf("expected account %d, got %d", available.ID, selection.Account.ID)
 	}
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
+func TestOpenAISelectAccountWithLoadAwareness_CompactDBRecheckRestoresTierZeroSnapshotCandidate(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(2)
+	stale := &Account{
+		ID:          9001,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Priority:    0,
+		Extra: map[string]any{
+			"openai_compact_supported": false,
+		},
+	}
+	fresh := Account{
+		ID:          9001,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Priority:    0,
+		Extra: map[string]any{
+			"openai_compact_supported": true,
+		},
+	}
+	snapshotCache := &openAISnapshotCacheStub{
+		snapshotAccounts: []*Account{stale},
+		accountsByID:     map[int64]*Account{9001: stale},
+	}
+	svc := &OpenAIGatewayService{
+		accountRepo:       stubOpenAIAccountRepo{accounts: []Account{fresh}},
+		cfg:               &config.Config{},
+		schedulerSnapshot: &SchedulerSnapshotService{cache: snapshotCache},
+		concurrencyService: NewConcurrencyService(stubConcurrencyCache{loadMap: map[int64]*AccountLoadInfo{
+			9001: {AccountID: 9001, LoadRate: 10, WaitingCount: 0},
+		}}),
+	}
+
+	selection, err := svc.selectAccountWithLoadAwareness(ctx, &groupID, "", "gpt-5.4", nil, true)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(9001), selection.Account.ID)
 	if selection.ReleaseFunc != nil {
 		selection.ReleaseFunc()
 	}
@@ -762,6 +816,17 @@ func TestOpenAISelectAccountForModelWithExclusions_NoAccounts(t *testing.T) {
 	if !strings.Contains(err.Error(), "no available OpenAI accounts") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+func TestOpenAISelectAccountForModelWithExclusions_CompactNoAccountsReturnsCompactError(t *testing.T) {
+	svc := &OpenAIGatewayService{
+		accountRepo: stubOpenAIAccountRepo{accounts: nil},
+		cache:       &stubGatewayCache{},
+	}
+
+	acc, err := svc.selectAccountForModelWithExclusions(context.Background(), nil, "", "", nil, true, 0)
+	require.ErrorIs(t, err, ErrNoAvailableCompactAccounts)
+	require.Nil(t, acc)
 }
 
 func TestOpenAISelectAccountWithLoadAwareness_NoCandidates(t *testing.T) {
@@ -1106,7 +1171,7 @@ func TestOpenAIStreamingPassthroughMissingTerminalEventReturnsIncompleteError(t 
 		_, _ = pw.Write([]byte("data: {\"type\":\"response.in_progress\",\"response\":{}}\n\n"))
 	}()
 
-	_, err := svc.handleStreamingResponsePassthrough(c.Request.Context(), resp, c, &Account{ID: 1}, time.Now())
+	_, err := svc.handleStreamingResponsePassthrough(c.Request.Context(), resp, c, &Account{ID: 1}, time.Now(), "", "")
 	_ = pr.Close()
 	if err == nil || !strings.Contains(err.Error(), "missing terminal event") {
 		t.Fatalf("expected missing terminal event error, got %v", err)
@@ -1138,7 +1203,7 @@ func TestOpenAIStreamingPassthroughResponseDoneWithoutDoneMarkerStillSucceeds(t 
 		_, _ = pw.Write([]byte("data: {\"type\":\"response.done\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":1}}}}\n\n"))
 	}()
 
-	result, err := svc.handleStreamingResponsePassthrough(c.Request.Context(), resp, c, &Account{ID: 1}, time.Now())
+	result, err := svc.handleStreamingResponsePassthrough(c.Request.Context(), resp, c, &Account{ID: 1}, time.Now(), "", "")
 	_ = pr.Close()
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -1146,6 +1211,70 @@ func TestOpenAIStreamingPassthroughResponseDoneWithoutDoneMarkerStillSucceeds(t 
 	require.Equal(t, 2, result.usage.InputTokens)
 	require.Equal(t, 3, result.usage.OutputTokens)
 	require.Equal(t, 1, result.usage.CacheReadInputTokens)
+}
+
+func TestOpenAIStreamingPassthroughRewritesMappedModelToOriginal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			MaxLineSize: defaultMaxLineSize,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+
+	pr, pw := io.Pipe()
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       pr,
+		Header:     http.Header{},
+	}
+
+	go func() {
+		defer func() { _ = pw.Close() }()
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.done\",\"response\":{\"model\":\"gpt-5.4-openai-compact\",\"usage\":{\"input_tokens\":2,\"output_tokens\":3}}}\n\n"))
+	}()
+
+	result, err := svc.handleStreamingResponsePassthrough(
+		c.Request.Context(),
+		resp,
+		c,
+		&Account{ID: 1},
+		time.Now(),
+		"gpt-5.4",
+		"gpt-5.4-openai-compact",
+	)
+	_ = pr.Close()
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Contains(t, rec.Body.String(), "\"gpt-5.4\"")
+	require.NotContains(t, rec.Body.String(), "gpt-5.4-openai-compact")
+}
+
+func TestHandlePassthroughSSEToJSONFallbackRewritesMappedModelToOriginal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &OpenAIGatewayService{cfg: &config.Config{}}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type": []string{"text/event-stream"},
+		},
+	}
+	body := []byte("data: {\"type\":\"response.in_progress\",\"response\":{\"model\":\"gpt-5.4-openai-compact\"}}\n\n")
+
+	usage, err := svc.handlePassthroughSSEToJSON(resp, c, body, "gpt-5.4", "gpt-5.4-openai-compact")
+	require.NoError(t, err)
+	require.NotNil(t, usage)
+	require.Contains(t, rec.Body.String(), "\"gpt-5.4\"")
+	require.NotContains(t, rec.Body.String(), "gpt-5.4-openai-compact")
 }
 
 func TestOpenAIStreamingTooLong(t *testing.T) {
