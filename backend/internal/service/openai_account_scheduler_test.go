@@ -515,7 +515,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_RequiredWSV2_NoAvailabl
 	require.Equal(t, 0, decision.CandidateCount)
 }
 
-func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactNoAccountsReturnsCompactError(t *testing.T) {
+func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactNoAccountsReturnsAvailabilityError(t *testing.T) {
 	ctx := context.Background()
 	groupID := int64(1014)
 
@@ -536,13 +536,14 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactNoAccountsReturn
 		OpenAIUpstreamTransportAny,
 		true,
 	)
-	require.ErrorIs(t, err, ErrNoAvailableCompactAccounts)
+	require.Error(t, err)
 	require.Nil(t, selection)
 	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
 	require.Equal(t, 0, decision.CandidateCount)
+	require.ErrorContains(t, err, "supporting model: gpt-5.4")
 }
 
-func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactFilteredEmptyReturnsCompactError(t *testing.T) {
+func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactFilteredTransportMismatchReturnsAvailabilityError(t *testing.T) {
 	ctx := context.Background()
 	groupID := int64(1015)
 	accounts := []Account{
@@ -573,10 +574,53 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactFilteredEmptyRet
 		OpenAIUpstreamTransportResponsesWebsocketV2,
 		true,
 	)
-	require.ErrorIs(t, err, ErrNoAvailableCompactAccounts)
+	require.Error(t, err)
 	require.Nil(t, selection)
 	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
 	require.Equal(t, 0, decision.CandidateCount)
+	require.ErrorContains(t, err, "supporting model: gpt-5.4")
+}
+
+func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactUnsupportedModelReturnsModelError(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(1016)
+	accounts := []Account{
+		{
+			ID:          2306,
+			Platform:    PlatformOpenAI,
+			Type:        AccountTypeOAuth,
+			Status:      StatusActive,
+			Schedulable: true,
+			Concurrency: 1,
+			Credentials: map[string]any{"model_mapping": map[string]any{"gpt-3.5-turbo": "gpt-3.5-turbo"}},
+			Extra: map[string]any{
+				"openai_compact_supported": true,
+			},
+		},
+	}
+
+	svc := &OpenAIGatewayService{
+		accountRepo:        stubOpenAIAccountRepo{accounts: accounts},
+		cache:              &stubGatewayCache{},
+		cfg:                &config.Config{},
+		concurrencyService: NewConcurrencyService(stubConcurrencyCache{}),
+	}
+
+	selection, decision, err := svc.SelectAccountWithScheduler(
+		ctx,
+		&groupID,
+		"",
+		"",
+		"gpt-5.4",
+		nil,
+		OpenAIUpstreamTransportAny,
+		true,
+	)
+	require.Error(t, err)
+	require.Nil(t, selection)
+	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+	require.Equal(t, 0, decision.CandidateCount)
+	require.ErrorContains(t, err, "supporting model: gpt-5.4")
 }
 
 func TestOpenAIGatewayService_SelectAccountWithScheduler_RequiredWSV2_DBRuntimeRecheckSkipsStickyTransportMismatch(t *testing.T) {

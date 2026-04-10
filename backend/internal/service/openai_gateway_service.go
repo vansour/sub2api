@@ -1218,8 +1218,8 @@ func (s *OpenAIGatewayService) SelectAccountForModelWithExclusions(ctx context.C
 	return s.selectAccountForModelWithExclusions(ctx, groupID, sessionHash, requestedModel, excludedIDs, false, 0)
 }
 
-func noAvailableOpenAISelectionError(requestedModel string, requireCompact bool) error {
-	if requireCompact {
+func noAvailableOpenAISelectionError(requestedModel string, compactBlocked bool) error {
+	if compactBlocked {
 		return ErrNoAvailableCompactAccounts
 	}
 	if requestedModel != "" {
@@ -1308,7 +1308,7 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.C
 		if compactBlocked {
 			return nil, ErrNoAvailableCompactAccounts
 		}
-		return nil, noAvailableOpenAISelectionError(requestedModel, requireCompact)
+		return nil, noAvailableOpenAISelectionError(requestedModel, false)
 	}
 
 	// 4. 设置粘性会话绑定
@@ -1385,7 +1385,7 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID 
 func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *int64, accounts []Account, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool) (*Account, bool) {
 	var selected *Account
 	selectedCompactTier := -1
-	sawBaseCandidate := false
+	compactBlocked := false
 	needsUpstreamCheck := s.needsUpstreamChannelRestrictionCheck(ctx, groupID)
 
 	for i := range accounts {
@@ -1401,8 +1401,7 @@ func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *i
 		if fresh == nil {
 			continue
 		}
-		sawBaseCandidate = true
-		fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, requestedModel, requireCompact)
+		fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, requestedModel, false)
 		if fresh == nil {
 			continue
 		}
@@ -1413,6 +1412,7 @@ func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *i
 		if requireCompact {
 			compactTier = openAICompactSupportTier(fresh)
 			if compactTier == 0 {
+				compactBlocked = true
 				continue
 			}
 		}
@@ -1438,7 +1438,7 @@ func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *i
 		}
 	}
 
-	return selected, requireCompact && sawBaseCandidate && selected == nil
+	return selected, compactBlocked
 }
 
 // isBetterAccount 判断 candidate 是否比 current 更优。
@@ -3237,8 +3237,9 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 }
 
 // handlePassthroughSSEToJSON converts an SSE response body into a JSON
-// response for the passthrough path. It mirrors handleSSEToJSON but skips
-// model replacement (passthrough does not remap models).
+// response for the passthrough path. It mirrors handleSSEToJSON while
+// preserving passthrough payloads, except compact-only model remapping may
+// rewrite model fields back to the original requested model.
 func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c *gin.Context, body []byte, originalModel string, mappedModel string) (*OpenAIUsage, error) {
 	bodyText := string(body)
 	finalResponse, ok := extractCodexFinalResponse(bodyText)

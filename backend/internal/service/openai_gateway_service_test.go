@@ -818,15 +818,38 @@ func TestOpenAISelectAccountForModelWithExclusions_NoAccounts(t *testing.T) {
 	}
 }
 
-func TestOpenAISelectAccountForModelWithExclusions_CompactNoAccountsReturnsCompactError(t *testing.T) {
+func TestOpenAISelectAccountForModelWithExclusions_CompactNoAccountsReturnsAvailabilityError(t *testing.T) {
 	svc := &OpenAIGatewayService{
 		accountRepo: stubOpenAIAccountRepo{accounts: nil},
 		cache:       &stubGatewayCache{},
 	}
 
 	acc, err := svc.selectAccountForModelWithExclusions(context.Background(), nil, "", "", nil, true, 0)
-	require.ErrorIs(t, err, ErrNoAvailableCompactAccounts)
+	require.Error(t, err)
 	require.Nil(t, acc)
+	require.False(t, errors.Is(err, ErrNoAvailableCompactAccounts))
+	require.ErrorContains(t, err, "no available OpenAI accounts")
+}
+
+func TestOpenAISelectAccountForModelWithExclusions_CompactNoModelSupportReturnsModelError(t *testing.T) {
+	svc := &OpenAIGatewayService{
+		accountRepo: stubOpenAIAccountRepo{accounts: []Account{
+			{
+				ID:          1,
+				Platform:    PlatformOpenAI,
+				Status:      StatusActive,
+				Schedulable: true,
+				Credentials: map[string]any{"model_mapping": map[string]any{"gpt-3.5-turbo": "gpt-3.5-turbo"}},
+			},
+		}},
+		cache: &stubGatewayCache{},
+	}
+
+	acc, err := svc.selectAccountForModelWithExclusions(context.Background(), nil, "", "gpt-4", nil, true, 0)
+	require.Error(t, err)
+	require.Nil(t, acc)
+	require.False(t, errors.Is(err, ErrNoAvailableCompactAccounts))
+	require.ErrorContains(t, err, "supporting model: gpt-4")
 }
 
 func TestOpenAISelectAccountWithLoadAwareness_NoCandidates(t *testing.T) {
