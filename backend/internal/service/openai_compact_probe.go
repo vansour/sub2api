@@ -78,6 +78,9 @@ func buildOpenAICompactProbeExtraUpdates(resp *http.Response, body []byte, probe
 		if errMsg == "" && len(body) > 0 {
 			errMsg = strings.TrimSpace(string(body))
 		}
+		if errMsg == "" && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
+			errMsg = "HTTP " + strconv.Itoa(resp.StatusCode)
+		}
 		errMsg = truncateString(sanitizeUpstreamErrorMessage(errMsg), 2048)
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			updates["openai_compact_supported"] = true

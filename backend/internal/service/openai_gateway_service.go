@@ -1308,7 +1308,7 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.C
 		if compactBlocked {
 			return nil, ErrNoAvailableCompactAccounts
 		}
-		return nil, noAvailableOpenAISelectionError(requestedModel, false)
+		return nil, noAvailableOpenAISelectionError(requestedModel, requireCompact)
 	}
 
 	// 4. 设置粘性会话绑定

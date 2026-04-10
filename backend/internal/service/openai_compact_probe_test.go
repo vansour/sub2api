@@ -108,3 +108,15 @@ func TestBuildOpenAICompactProbeExtraUpdates_UnknownModelDoesNotMarkUnsupported(
 		t.Fatalf("openai_compact_last_status = %v, want %d", got, http.StatusBadRequest)
 	}
 }
+
+func TestBuildOpenAICompactProbeExtraUpdates_EmptyFailureBodyFallsBackToHTTPStatus(t *testing.T) {
+	now := time.Date(2026, 4, 10, 10, 0, 0, 0, time.UTC)
+	updates := buildOpenAICompactProbeExtraUpdates(&http.Response{StatusCode: http.StatusServiceUnavailable}, nil, nil, now)
+
+	if got := updates["openai_compact_last_status"]; got != http.StatusServiceUnavailable {
+		t.Fatalf("openai_compact_last_status = %v, want %d", got, http.StatusServiceUnavailable)
+	}
+	if got := updates["openai_compact_last_error"]; got != "HTTP 503" {
+		t.Fatalf("openai_compact_last_error = %v, want HTTP 503", got)
+	}
+}

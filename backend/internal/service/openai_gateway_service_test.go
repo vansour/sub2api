@@ -818,6 +818,17 @@ func TestOpenAISelectAccountForModelWithExclusions_NoAccounts(t *testing.T) {
 	}
 }
 
+func TestOpenAISelectAccountForModelWithExclusions_CompactNoAccountsReturnsCompactError(t *testing.T) {
+	svc := &OpenAIGatewayService{
+		accountRepo: stubOpenAIAccountRepo{accounts: nil},
+		cache:       &stubGatewayCache{},
+	}
+
+	acc, err := svc.selectAccountForModelWithExclusions(context.Background(), nil, "", "", nil, true, 0)
+	require.ErrorIs(t, err, ErrNoAvailableCompactAccounts)
+	require.Nil(t, acc)
+}
+
 func TestOpenAISelectAccountWithLoadAwareness_NoCandidates(t *testing.T) {
 	groupID := int64(1)
 	resetAt := time.Now().Add(1 * time.Hour)

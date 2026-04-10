@@ -3,7 +3,6 @@ package service
 import (
 	"container/heap"
 	"context"
-	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -578,7 +577,10 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		return nil, 0, 0, 0, err
 	}
 	if len(accounts) == 0 {
-		return nil, 0, 0, 0, errors.New("no available OpenAI accounts")
+		if req.RequireCompact {
+			return nil, 0, 0, 0, ErrNoAvailableCompactAccounts
+		}
+		return nil, 0, 0, 0, ErrNoAvailableAccounts
 	}
 
 	// require_privacy_set: 获取分组信息
@@ -618,7 +620,10 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		})
 	}
 	if len(filtered) == 0 {
-		return nil, 0, 0, 0, errors.New("no available OpenAI accounts")
+		if req.RequireCompact {
+			return nil, 0, 0, 0, ErrNoAvailableCompactAccounts
+		}
+		return nil, 0, 0, 0, ErrNoAvailableAccounts
 	}
 
 	loadMap := map[int64]*AccountLoadInfo{}
