@@ -41,17 +41,17 @@ func shouldMarkOpenAICompactUnsupported(status int, body []byte) bool {
 		return true
 	case http.StatusBadRequest, http.StatusForbidden, http.StatusUnprocessableEntity:
 		lower := strings.ToLower(strings.TrimSpace(extractUpstreamErrorMessage(body) + " " + string(body)))
-		for _, keyword := range []string{
-			"compact",
-			"unsupported",
-			"not support",
-			"does not support",
-			"not found",
-			"unknown model",
-			"model not found",
-		} {
-			if strings.Contains(lower, keyword) {
-				return true
+		if strings.Contains(lower, "compact") {
+			for _, keyword := range []string{
+				"unsupported",
+				"not support",
+				"does not support",
+				"not available",
+				"disabled",
+			} {
+				if strings.Contains(lower, keyword) {
+					return true
+				}
 			}
 		}
 	}

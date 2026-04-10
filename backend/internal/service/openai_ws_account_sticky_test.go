@@ -305,6 +305,64 @@ func TestOpenAIGatewayService_SelectAccountByPreviousResponseID_CompactUnsupport
 	require.Zero(t, boundAccountID, "compact-ineligible sticky binding should be cleared")
 }
 
+func TestOpenAIGatewayService_SelectAccountByPreviousResponseID_CompactDBRecheckRestoresSupportedAccount(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(26)
+	stale := &Account{
+		ID:          41,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Extra: map[string]any{
+			"openai_apikey_responses_websockets_v2_enabled": true,
+			"openai_compact_supported":                      false,
+		},
+	}
+	fresh := Account{
+		ID:          41,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Extra: map[string]any{
+			"openai_apikey_responses_websockets_v2_enabled": true,
+			"openai_compact_supported":                      true,
+		},
+	}
+	cache := &stubGatewayCache{}
+	store := NewOpenAIWSStateStore(cache)
+	cfg := newOpenAIWSV2TestConfig()
+	snapshotCache := &openAISnapshotCacheStub{
+		accountsByID: map[int64]*Account{41: stale},
+	}
+	svc := &OpenAIGatewayService{
+		accountRepo:        stubOpenAIAccountRepo{accounts: []Account{fresh}},
+		cache:              cache,
+		cfg:                cfg,
+		concurrencyService: NewConcurrencyService(stubConcurrencyCache{}),
+		openaiWSStateStore: store,
+		schedulerSnapshot:  &SchedulerSnapshotService{cache: snapshotCache},
+	}
+
+	require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp_prev_compact_db_fix", 41, time.Hour))
+
+	selection, err := svc.SelectAccountByPreviousResponseID(ctx, &groupID, "resp_prev_compact_db_fix", "gpt-5.4", nil, true)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(41), selection.Account.ID)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+
+	boundAccountID, getErr := store.GetResponseAccount(ctx, groupID, "resp_prev_compact_db_fix")
+	require.NoError(t, getErr)
+	require.Equal(t, int64(41), boundAccountID)
+}
+
 func newOpenAIWSV2TestConfig() *config.Config {
 	cfg := &config.Config{}
 	cfg.Gateway.OpenAIWS.Enabled = true

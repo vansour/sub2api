@@ -80,3 +80,16 @@ func TestBuildOpenAICompactProbeExtraUpdates_RequestErrorDoesNotMarkUnsupported(
 		t.Fatalf("expected openai_compact_last_error to be populated")
 	}
 }
+
+func TestBuildOpenAICompactProbeExtraUpdates_UnknownModelDoesNotMarkUnsupported(t *testing.T) {
+	now := time.Date(2026, 4, 10, 10, 0, 0, 0, time.UTC)
+	body := []byte(`{"error":{"message":"unknown model gpt-5.4-openai-compact"}}`)
+	updates := buildOpenAICompactProbeExtraUpdates(&http.Response{StatusCode: http.StatusBadRequest}, body, nil, now)
+
+	if _, exists := updates["openai_compact_supported"]; exists {
+		t.Fatalf("did not expect openai_compact_supported for unknown-model diagnostics")
+	}
+	if got := updates["openai_compact_last_status"]; got != http.StatusBadRequest {
+		t.Fatalf("openai_compact_last_status = %v, want %d", got, http.StatusBadRequest)
+	}
+}
