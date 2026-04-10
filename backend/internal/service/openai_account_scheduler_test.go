@@ -194,6 +194,49 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_PreviousResponseSticky(
 	}
 }
 
+func TestOpenAIGatewayService_SelectAccountWithScheduler_PreviousResponseTransportMismatchReleasesSlot(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(9009)
+	account := Account{
+		ID:          1002,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Extra: map[string]any{
+			"openai_apikey_responses_websockets_v2_enabled": true,
+		},
+	}
+	releaseCounts := map[int64]int{}
+	cache := &stubGatewayCache{}
+	svc := &OpenAIGatewayService{
+		accountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
+		cache:       cache,
+		cfg:         newOpenAIWSV2TestConfig(),
+		concurrencyService: NewConcurrencyService(stubConcurrencyCache{
+			releaseCounts: releaseCounts,
+		}),
+	}
+
+	store := svc.getOpenAIWSStateStore()
+	require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp_prev_release", account.ID, time.Hour))
+
+	selection, _, err := svc.SelectAccountWithScheduler(
+		ctx,
+		&groupID,
+		"resp_prev_release",
+		"",
+		"gpt-5.1",
+		nil,
+		OpenAIUpstreamTransport("bogus"),
+		false,
+	)
+	require.Error(t, err)
+	require.Nil(t, selection)
+	require.Equal(t, 1, releaseCounts[account.ID])
+}
+
 func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionSticky(t *testing.T) {
 	ctx := context.Background()
 	groupID := int64(10)
