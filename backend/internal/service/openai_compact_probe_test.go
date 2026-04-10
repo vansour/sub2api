@@ -76,8 +76,23 @@ func TestBuildOpenAICompactProbeExtraUpdates_RequestErrorDoesNotMarkUnsupported(
 	if _, exists := updates["openai_compact_supported"]; exists {
 		t.Fatalf("did not expect openai_compact_supported for request error")
 	}
+	if got, exists := updates["openai_compact_last_status"]; !exists || got != nil {
+		t.Fatalf("openai_compact_last_status = %v, want nil key", got)
+	}
 	if got := updates["openai_compact_last_error"]; got == "" {
 		t.Fatalf("expected openai_compact_last_error to be populated")
+	}
+}
+
+func TestBuildOpenAICompactProbeExtraUpdates_NoResponseClearsLastStatus(t *testing.T) {
+	now := time.Date(2026, 4, 10, 10, 0, 0, 0, time.UTC)
+	updates := buildOpenAICompactProbeExtraUpdates(nil, nil, nil, now)
+
+	if got, exists := updates["openai_compact_last_status"]; !exists || got != nil {
+		t.Fatalf("openai_compact_last_status = %v, want nil key", got)
+	}
+	if got := updates["openai_compact_last_error"]; got != "compact probe failed" {
+		t.Fatalf("openai_compact_last_error = %v, want compact probe failed", got)
 	}
 }
 

@@ -426,6 +426,56 @@ func TestOpenAISelectAccountWithLoadAwareness_FiltersUnschedulableWhenNoConcurre
 	}
 }
 
+func TestOpenAISelectAccountWithLoadAwareness_CompactDBRecheckRestoresTierZeroSnapshotCandidate(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(2)
+	stale := &Account{
+		ID:          9001,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Priority:    0,
+		Extra: map[string]any{
+			"openai_compact_supported": false,
+		},
+	}
+	fresh := Account{
+		ID:          9001,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Priority:    0,
+		Extra: map[string]any{
+			"openai_compact_supported": true,
+		},
+	}
+	snapshotCache := &openAISnapshotCacheStub{
+		snapshotAccounts: []*Account{stale},
+		accountsByID:     map[int64]*Account{9001: stale},
+	}
+	svc := &OpenAIGatewayService{
+		accountRepo:       stubOpenAIAccountRepo{accounts: []Account{fresh}},
+		cfg:               &config.Config{},
+		schedulerSnapshot: &SchedulerSnapshotService{cache: snapshotCache},
+		concurrencyService: NewConcurrencyService(stubConcurrencyCache{loadMap: map[int64]*AccountLoadInfo{
+			9001: {AccountID: 9001, LoadRate: 10, WaitingCount: 0},
+		}}),
+	}
+
+	selection, err := svc.selectAccountWithLoadAwareness(ctx, &groupID, "", "gpt-5.4", nil, true)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(9001), selection.Account.ID)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
 func TestOpenAISelectAccountForModelWithExclusions_StickyUnschedulableClearsSession(t *testing.T) {
 	sessionHash := "session-1"
 	repo := stubOpenAIAccountRepo{

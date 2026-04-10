@@ -60,7 +60,8 @@ func shouldMarkOpenAICompactUnsupported(status int, body []byte) bool {
 
 func buildOpenAICompactProbeExtraUpdates(resp *http.Response, body []byte, probeErr error, now time.Time) map[string]any {
 	updates := map[string]any{
-		"openai_compact_checked_at": now.Format(time.RFC3339),
+		"openai_compact_checked_at":  now.Format(time.RFC3339),
+		"openai_compact_last_status": nil,
 	}
 
 	if resp != nil {

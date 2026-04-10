@@ -472,6 +472,101 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_RequiredWSV2_NoAvailabl
 	require.Equal(t, 0, decision.CandidateCount)
 }
 
+func TestOpenAIGatewayService_SelectAccountWithScheduler_RequiredWSV2_DBRuntimeRecheckSkipsStickyTransportMismatch(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(1013)
+	staleSticky := &Account{
+		ID:          2303,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Priority:    0,
+		Extra: map[string]any{
+			"openai_apikey_responses_websockets_v2_enabled": true,
+		},
+	}
+	staleFallback := &Account{
+		ID:          2304,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Priority:    5,
+		Extra: map[string]any{
+			"openai_apikey_responses_websockets_v2_enabled": true,
+		},
+	}
+	dbSticky := Account{
+		ID:          2303,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Priority:    0,
+	}
+	dbFallback := Account{
+		ID:          2304,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Priority:    5,
+		Extra: map[string]any{
+			"openai_apikey_responses_websockets_v2_enabled": true,
+		},
+	}
+	cache := &stubGatewayCache{
+		sessionBindings: map[string]int64{
+			"openai:session_hash_ws_db_only": 2303,
+		},
+	}
+	snapshotCache := &openAISnapshotCacheStub{
+		snapshotAccounts: []*Account{staleSticky, staleFallback},
+		accountsByID: map[int64]*Account{
+			2303: staleSticky,
+			2304: staleFallback,
+		},
+	}
+	concurrencyCache := stubConcurrencyCache{
+		loadMap: map[int64]*AccountLoadInfo{
+			2303: {AccountID: 2303, LoadRate: 0, WaitingCount: 0},
+			2304: {AccountID: 2304, LoadRate: 10, WaitingCount: 0},
+		},
+	}
+	svc := &OpenAIGatewayService{
+		accountRepo:        stubOpenAIAccountRepo{accounts: []Account{dbSticky, dbFallback}},
+		cache:              cache,
+		cfg:                newOpenAIWSV2TestConfig(),
+		schedulerSnapshot:  &SchedulerSnapshotService{cache: snapshotCache},
+		concurrencyService: NewConcurrencyService(concurrencyCache),
+	}
+
+	selection, decision, err := svc.SelectAccountWithScheduler(
+		ctx,
+		&groupID,
+		"",
+		"session_hash_ws_db_only",
+		"gpt-5.1",
+		nil,
+		OpenAIUpstreamTransportResponsesWebsocketV2,
+		false,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(2304), selection.Account.ID)
+	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+	require.Equal(t, 1, cache.deletedSessions["openai:session_hash_ws_db_only"])
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
 func TestOpenAIGatewayService_SelectAccountWithScheduler_LoadBalanceTopKFallback(t *testing.T) {
 	ctx := context.Background()
 	groupID := int64(11)
@@ -652,6 +747,71 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactPrefersSupported
 	}
 }
 
+func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactMetricsIgnoreExplicitlyUnsupported(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(16006)
+	accounts := []Account{
+		{
+			ID:          6601,
+			Platform:    PlatformOpenAI,
+			Type:        AccountTypeAPIKey,
+			Status:      StatusActive,
+			Schedulable: true,
+			Concurrency: 1,
+			Priority:    0,
+			Extra: map[string]any{
+				"openai_compact_supported": false,
+			},
+		},
+		{
+			ID:          6602,
+			Platform:    PlatformOpenAI,
+			Type:        AccountTypeAPIKey,
+			Status:      StatusActive,
+			Schedulable: true,
+			Concurrency: 1,
+			Priority:    0,
+			Extra: map[string]any{
+				"openai_compact_supported": true,
+			},
+		},
+	}
+	concurrencyCache := stubConcurrencyCache{
+		loadMap: map[int64]*AccountLoadInfo{
+			6601: {AccountID: 6601, LoadRate: 0, WaitingCount: 0},
+			6602: {AccountID: 6602, LoadRate: 92, WaitingCount: 7},
+		},
+	}
+	svc := &OpenAIGatewayService{
+		accountRepo:        stubOpenAIAccountRepo{accounts: accounts},
+		cache:              &stubGatewayCache{},
+		cfg:                &config.Config{},
+		concurrencyService: NewConcurrencyService(concurrencyCache),
+	}
+
+	selection, decision, err := svc.SelectAccountWithScheduler(
+		ctx,
+		&groupID,
+		"",
+		"session_hash_compact_metrics",
+		"gpt-5.4",
+		nil,
+		OpenAIUpstreamTransportAny,
+		true,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(6602), selection.Account.ID)
+	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+	require.Equal(t, 1, decision.CandidateCount)
+	require.Equal(t, 1, decision.TopK)
+	require.Equal(t, 0.0, decision.LoadSkew)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
 func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactFallsBackToUnknownWhenNoSupported(t *testing.T) {
 	ctx := context.Background()
 	groupID := int64(16002)
@@ -758,6 +918,67 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactRejectsExplicitl
 	require.ErrorIs(t, err, ErrNoAvailableCompactAccounts)
 	require.Nil(t, selection)
 	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+}
+
+func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactLoadBalanceDBRecheckRestoresTierZeroSnapshotCandidate(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(16007)
+	stale := &Account{
+		ID:          6701,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Priority:    0,
+		Extra: map[string]any{
+			"openai_compact_supported": false,
+		},
+	}
+	fresh := Account{
+		ID:          6701,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Priority:    0,
+		Extra: map[string]any{
+			"openai_compact_supported": true,
+		},
+	}
+	snapshotCache := &openAISnapshotCacheStub{
+		snapshotAccounts: []*Account{stale},
+		accountsByID:     map[int64]*Account{6701: stale},
+	}
+	svc := &OpenAIGatewayService{
+		accountRepo:        stubOpenAIAccountRepo{accounts: []Account{fresh}},
+		cache:              &stubGatewayCache{},
+		cfg:                &config.Config{},
+		schedulerSnapshot:  &SchedulerSnapshotService{cache: snapshotCache},
+		concurrencyService: NewConcurrencyService(stubConcurrencyCache{}),
+	}
+
+	selection, decision, err := svc.SelectAccountWithScheduler(
+		ctx,
+		&groupID,
+		"",
+		"",
+		"gpt-5.4",
+		nil,
+		OpenAIUpstreamTransportAny,
+		true,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(6701), selection.Account.ID)
+	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+	require.Equal(t, 0, decision.CandidateCount)
+	require.Equal(t, 0, decision.TopK)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
 }
 
 func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactSessionStickyDBRecheckRestoresSupportedAccount(t *testing.T) {
