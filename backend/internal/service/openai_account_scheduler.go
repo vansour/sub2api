@@ -27,6 +27,7 @@ type OpenAIAccountScheduleRequest struct {
 	StickyAccountID    int64
 	PreviousResponseID string
 	RequestedModel     string
+	RequireCompact     bool
 	RequiredTransport  OpenAIUpstreamTransport
 	ExcludedIDs        map[int64]struct{}
 }
@@ -241,6 +242,7 @@ func (s *defaultOpenAIAccountScheduler) Select(
 			previousResponseID,
 			req.RequestedModel,
 			req.ExcludedIDs,
+			req.RequireCompact,
 		)
 		if err != nil {
 			return nil, decision, err
@@ -327,11 +329,15 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	if req.RequestedModel != "" && !account.IsModelSupported(req.RequestedModel) {
 		return nil, nil
 	}
+	if req.RequireCompact && openAICompactSupportTier(account) == 0 {
+		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
+		return nil, nil
+	}
 	if !s.isAccountTransportCompatible(account, req.RequiredTransport) {
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, nil
 	}
-	account = s.service.recheckSelectedOpenAIAccountFromDB(ctx, account, req.RequestedModel)
+	account = s.service.recheckSelectedOpenAIAccountFromDB(ctx, account, req.RequestedModel, req.RequireCompact)
 	if account == nil {
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, nil
@@ -616,6 +622,29 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		return nil, 0, 0, 0, errors.New("no available OpenAI accounts")
 	}
 
+	if req.RequireCompact {
+		bestTier := 0
+		for _, account := range filtered {
+			tier := openAICompactSupportTier(account)
+			if tier > bestTier {
+				bestTier = tier
+			}
+		}
+		if bestTier == 0 {
+			return nil, 0, 0, 0, ErrNoAvailableCompactAccounts
+		}
+		compactFiltered := make([]*Account, 0, len(filtered))
+		compactLoadReq := make([]AccountWithConcurrency, 0, len(loadReq))
+		for idx, account := range filtered {
+			if openAICompactSupportTier(account) == bestTier {
+				compactFiltered = append(compactFiltered, account)
+				compactLoadReq = append(compactLoadReq, loadReq[idx])
+			}
+		}
+		filtered = compactFiltered
+		loadReq = compactLoadReq
+	}
+
 	loadMap := map[int64]*AccountLoadInfo{}
 	if s.service.concurrencyService != nil {
 		if batchLoad, loadErr := s.service.concurrencyService.GetAccountsLoadBatch(ctx, loadReq); loadErr == nil {
@@ -705,11 +734,11 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 
 	for i := 0; i < len(selectionOrder); i++ {
 		candidate := selectionOrder[i]
-		fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.RequestedModel)
+		fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.RequestedModel, req.RequireCompact)
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) {
 			continue
 		}
-		fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.RequestedModel)
+		fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.RequestedModel, req.RequireCompact)
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) {
 			continue
 		}
@@ -732,7 +761,7 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 	cfg := s.service.schedulingConfig()
 	// WaitPlan.MaxConcurrency 使用 Concurrency（非 EffectiveLoadFactor），因为 WaitPlan 控制的是 Redis 实际并发槽位等待。
 	for _, candidate := range selectionOrder {
-		fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.RequestedModel)
+		fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.RequestedModel, req.RequireCompact)
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) {
 			continue
 		}
@@ -828,11 +857,12 @@ func (s *OpenAIGatewayService) SelectAccountWithScheduler(
 	requestedModel string,
 	excludedIDs map[int64]struct{},
 	requiredTransport OpenAIUpstreamTransport,
+	requireCompact bool,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
 	decision := OpenAIAccountScheduleDecision{}
 	scheduler := s.getOpenAIAccountScheduler()
 	if scheduler == nil {
-		selection, err := s.SelectAccountWithLoadAwareness(ctx, groupID, sessionHash, requestedModel, excludedIDs)
+		selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, sessionHash, requestedModel, excludedIDs, requireCompact)
 		decision.Layer = openAIAccountScheduleLayerLoadBalance
 		return selection, decision, err
 	}
@@ -850,6 +880,7 @@ func (s *OpenAIGatewayService) SelectAccountWithScheduler(
 		StickyAccountID:    stickyAccountID,
 		PreviousResponseID: previousResponseID,
 		RequestedModel:     requestedModel,
+		RequireCompact:     requireCompact,
 		RequiredTransport:  requiredTransport,
 		ExcludedIDs:        excludedIDs,
 	})

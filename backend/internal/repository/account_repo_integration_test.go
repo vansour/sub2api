@@ -811,6 +811,27 @@ func (s *AccountRepoSuite) TestUpdateExtra_SchedulerRelevantStillEnqueuesOutbox(
 	s.Require().Equal(1, count)
 }
 
+func (s *AccountRepoSuite) TestUpdateExtra_CompactCapabilityEnqueuesOutbox() {
+	account := mustCreateAccount(s.T(), s.client, &service.Account{
+		Name:     "acc-extra-compact-capability",
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
+		Extra:    map[string]any{},
+	})
+	_, err := s.repo.sql.ExecContext(s.ctx, "TRUNCATE scheduler_outbox")
+	s.Require().NoError(err)
+
+	s.Require().NoError(s.repo.UpdateExtra(s.ctx, account.ID, map[string]any{
+		"openai_compact_supported":  true,
+		"openai_compact_checked_at": "2026-04-10T10:00:00Z",
+	}))
+
+	var count int
+	err = scanSingleRow(s.ctx, s.repo.sql, "SELECT COUNT(*) FROM scheduler_outbox", nil, &count)
+	s.Require().NoError(err)
+	s.Require().Equal(1, count)
+}
+
 // --- GetByCRSAccountID ---
 
 func (s *AccountRepoSuite) TestGetByCRSAccountID() {

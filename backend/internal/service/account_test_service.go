@@ -159,7 +159,7 @@ func createTestPayload(modelID string) (map[string]any, error) {
 // TestAccountConnection tests an account's connection by sending a test request
 // All account types use full Claude Code client characteristics, only auth header differs
 // modelID is optional - if empty, defaults to claude.DefaultTestModel
-func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int64, modelID string, prompt string) error {
+func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int64, modelID string, prompt string, mode string) error {
 	ctx := c.Request.Context()
 
 	// Get account
@@ -170,7 +170,7 @@ func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int
 
 	// Route to platform-specific test method
 	if account.IsOpenAI() {
-		return s.testOpenAIAccountConnection(c, account, modelID)
+		return s.testOpenAIAccountConnection(c, account, modelID, normalizeAccountTestMode(mode))
 	}
 
 	if account.IsGemini() {
@@ -410,8 +410,9 @@ func (s *AccountTestService) testBedrockAccountConnection(c *gin.Context, ctx co
 }
 
 // testOpenAIAccountConnection tests an OpenAI account's connection
-func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account *Account, modelID string) error {
+func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account *Account, modelID string, mode string) error {
 	ctx := c.Request.Context()
+	mode = normalizeAccountTestMode(mode)
 
 	// Default to openai.DefaultTestModel for OpenAI testing
 	testModelID := modelID
@@ -419,14 +420,12 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 		testModelID = openai.DefaultTestModel
 	}
 
-	// For API Key accounts with model mapping, map the model
-	if account.Type == "apikey" {
-		mapping := account.GetModelMapping()
-		if len(mapping) > 0 {
-			if mappedModel, exists := mapping[testModelID]; exists {
-				testModelID = mappedModel
-			}
-		}
+	// Align test routing with gateway behavior: OpenAI accounts apply normal
+	// account model mapping, and compact mode applies compact-only mapping on top.
+	testModelID = account.GetMappedModel(testModelID)
+	if mode == AccountTestModeCompact {
+		testModelID = resolveOpenAICompactForwardModel(account, testModelID)
+		return s.testOpenAICompactConnection(c, account, testModelID)
 	}
 
 	// Determine authentication method and API URL
@@ -541,6 +540,121 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 
 	// Process SSE stream
 	return s.processOpenAIStream(c, resp.Body)
+}
+
+func (s *AccountTestService) testOpenAICompactConnection(c *gin.Context, account *Account, testModelID string) error {
+	ctx := c.Request.Context()
+
+	authToken := ""
+	apiURL := ""
+	isOAuth := false
+	chatgptAccountID := ""
+
+	switch {
+	case account.IsOAuth():
+		isOAuth = true
+		authToken = account.GetOpenAIAccessToken()
+		if authToken == "" {
+			return s.sendErrorAndEnd(c, "No access token available")
+		}
+		apiURL = chatgptCodexAPIURL + "/compact"
+		chatgptAccountID = account.GetChatGPTAccountID()
+	case account.Type == AccountTypeAPIKey:
+		authToken = account.GetOpenAIApiKey()
+		if authToken == "" {
+			return s.sendErrorAndEnd(c, "No API key available")
+		}
+		baseURL := account.GetOpenAIBaseURL()
+		if baseURL == "" {
+			baseURL = "https://api.openai.com"
+		}
+		normalizedBaseURL, err := s.validateUpstreamBaseURL(baseURL)
+		if err != nil {
+			return s.sendErrorAndEnd(c, fmt.Sprintf("Invalid base URL: %s", err.Error()))
+		}
+		apiURL = strings.TrimSuffix(normalizedBaseURL, "/") + "/responses/compact"
+	default:
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Unsupported account type: %s", account.Type))
+	}
+
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+	c.Writer.Flush()
+
+	payloadBytes, _ := json.Marshal(createOpenAICompactProbePayload(testModelID))
+	s.sendEvent(c, TestEvent{Type: "test_start", Model: testModelID})
+
+	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return s.sendErrorAndEnd(c, "Failed to create request")
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+authToken)
+	req.Header.Set("OpenAI-Beta", "responses=experimental")
+	req.Header.Set("Originator", "codex_cli_rs")
+	req.Header.Set("User-Agent", codexCLIUserAgent)
+	req.Header.Set("Version", codexCLIVersion)
+	probeSessionID := compactProbeSessionID(account.ID)
+	req.Header.Set("Session_ID", probeSessionID)
+	req.Header.Set("Conversation_ID", probeSessionID)
+
+	if isOAuth {
+		req.Host = "chatgpt.com"
+		if chatgptAccountID != "" {
+			req.Header.Set("chatgpt-account-id", chatgptAccountID)
+		}
+	}
+
+	proxyURL := ""
+	if account.ProxyID != nil && account.Proxy != nil {
+		proxyURL = account.Proxy.URL()
+	}
+
+	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
+	if err != nil {
+		if s.accountRepo != nil {
+			updates := buildOpenAICompactProbeExtraUpdates(nil, nil, err, time.Now())
+			_ = s.accountRepo.UpdateExtra(ctx, account.ID, updates)
+			mergeAccountExtra(account, updates)
+		}
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+
+	if s.accountRepo != nil {
+		updates := buildOpenAICompactProbeExtraUpdates(resp, body, nil, time.Now())
+		if codexUpdates, err := extractOpenAICodexProbeUpdates(resp); err == nil && len(codexUpdates) > 0 {
+			updates = mergeExtraUpdates(updates, codexUpdates)
+		}
+		if len(updates) > 0 {
+			_ = s.accountRepo.UpdateExtra(ctx, account.ID, updates)
+			mergeAccountExtra(account, updates)
+		}
+		if snapshot := ParseCodexRateLimitHeaders(resp.Header); snapshot != nil {
+			if resetAt := codexRateLimitResetAtFromSnapshot(snapshot, time.Now()); resetAt != nil {
+				_ = s.accountRepo.SetRateLimited(ctx, account.ID, *resetAt)
+				account.RateLimitResetAt = resetAt
+			}
+		}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusUnauthorized && s.accountRepo != nil {
+			errMsg := fmt.Sprintf("Authentication failed (401): %s", string(body))
+			_ = s.accountRepo.SetError(ctx, account.ID, errMsg)
+		}
+		return s.sendErrorAndEnd(c, fmt.Sprintf("API returned %d: %s", resp.StatusCode, string(body)))
+	}
+
+	s.sendEvent(c, TestEvent{Type: "content", Text: "Compact probe succeeded"})
+	s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
+	return nil
 }
 
 // testGeminiAccountConnection tests a Gemini account's connection
@@ -1063,7 +1177,7 @@ func (s *AccountTestService) RunTestBackground(ctx context.Context, accountID in
 	ginCtx, _ := gin.CreateTestContext(w)
 	ginCtx.Request = (&http.Request{}).WithContext(ctx)
 
-	testErr := s.TestAccountConnection(ginCtx, accountID, modelID, "")
+	testErr := s.TestAccountConnection(ginCtx, accountID, modelID, "", AccountTestModeDefault)
 
 	finishedAt := time.Now()
 	body := w.Body.String()
