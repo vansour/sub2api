@@ -1402,9 +1402,6 @@ func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *i
 			continue
 		}
 		sawBaseCandidate = true
-		if requireCompact && openAICompactSupportTier(fresh) == 0 {
-			continue
-		}
 		fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, requestedModel, requireCompact)
 		if fresh == nil {
 			continue
